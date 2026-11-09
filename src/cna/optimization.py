@@ -100,21 +100,43 @@ def cn_one_inference(input_segments, input_weights, phased, plot_path):
             cn_one = np.argmax(observed_hist) * HIST_RATE / cov_ploidy
             raise ProfileException("No histogram peaks found, defaulting to histogram maximum")
 
-        max_peak_id = max(filtered_peak_ids, key=lambda p: smooth_corr[peaks[p]])
-        logger.info("Max peak: {}".format(peaks[max_peak_id] * HIST_RATE))
+        # Use weighted mean coverage to guide peak selection (more representative than median)
+        # hist_mean already computed above as _weighted_means(input_segments, input_weights)
+        expected_cn1 = hist_mean / cov_ploidy if cov_ploidy > 0 else hist_mean
+        logger.info("Expected CN=1 (mean/ploidy): {}".format(expected_cn1))
+
+        # Score peaks by combination of autocorrelation amplitude and proximity to expected CN=1
+        # Higher weight for peaks near expected coverage
+        peak_scores = []
+        for pid in filtered_peak_ids:
+            peak_cov = peaks[pid] * HIST_RATE
+            # Autocorrelation score (original)
+            autocorr_score = smooth_corr[peaks[pid]]
+
+            # Proximity score: higher for peaks near expected CN=1 coverage
+            # Use Gaussian weighting: exp(-(peak-expected)^2 / (2*(expected/2)^2))
+            # Tighter width: expected/2 to prefer peaks close to expected
+            sigma = expected_cn1 / 2.0
+            proximity_score = np.exp(-((peak_cov - expected_cn1) ** 2) / (2 * sigma ** 2))
+
+            # Combined score: 60% autocorrelation, 40% proximity (more weight to expected)
+            combined_score = 0.6 * autocorr_score + 0.4 * proximity_score * np.max(smooth_corr)
+            peak_scores.append(combined_score)
+
+        # Find peak with highest combined score
+        max_peak_id = filtered_peak_ids[np.argmax(peak_scores)]
+        logger.info("Max peak (combined score): {} (expected: {})".format(peaks[max_peak_id] * HIST_RATE, expected_cn1))
 
         #Now, filter peaks that are too small, compared to the top peak
-        MIN_TO_PEAK = 0.5
-        MIN_TO_MAX = 0.2
-        min_height = max(smooth_corr[peaks[max_peak_id]] * MIN_TO_PEAK,
+        # Relax thresholds to keep peaks near median coverage
+        MIN_TO_PEAK = 0.3  # Reduced from 0.5
+        MIN_TO_MAX = 0.1   # Reduced from 0.2
+        # Use simpler threshold: either fraction of top peak OR fraction of saddle, whichever is lower
+        min_height = min(smooth_corr[peaks[max_peak_id]] * MIN_TO_PEAK,
                          max(smooth_corr[first_min:]) * MIN_TO_MAX)
-        #min_height = max(smooth_corr[peaks[max_peak_id]], smooth_corr[first_min]) * MIN_HEIGHT_TO_TOP
-        #min_height = smooth_corr[peaks[max_peak_id]] * MIN_HEIGHT_TO_TOP
-        #min_height = max(smooth_corr[first_min:]) * MIN_HEIGHT_TO_TOP
-
 
         filtered_peak_ids = [i for i in filtered_peak_ids if smooth_corr[peaks[i]] > min_height]
-        logger.info("Peaks >0.5 of top/saddle: {}".format([round(peaks[i] * HIST_RATE, 2) for i in filtered_peak_ids]))
+        logger.info("Peaks >{} of top/saddle: {}".format(MIN_TO_PEAK, [round(peaks[i] * HIST_RATE, 2) for i in filtered_peak_ids]))
 
         if len(filtered_peak_ids) == 0:
             cn_one = np.argmax(observed_hist) * HIST_RATE / cov_ploidy
@@ -123,11 +145,15 @@ def cn_one_inference(input_segments, input_weights, phased, plot_path):
 
         scaled_peaks = [round(peaks[p] * HIST_RATE, 2) for p in filtered_peak_ids]
 
-        if max_peak_id == filtered_peak_ids[0]:
+        # Use the peak with highest combined score (already max_peak_id)
+        # or the first peak if our max peak isn't in filtered list
+        if max_peak_id not in filtered_peak_ids:
             cn_one = peaks[filtered_peak_ids[0]] * HIST_RATE
         else:
             cn_one = peaks[max_peak_id] * HIST_RATE
-            cn_one_alt = peaks[filtered_peak_ids[0]] * HIST_RATE
+            # Check if there's an alternative peak (half-peak scenario)
+            if len(filtered_peak_ids) > 1 and filtered_peak_ids[0] != max_peak_id:
+                cn_one_alt = peaks[filtered_peak_ids[0]] * HIST_RATE
 
     except ProfileException as e:
         logger.info(e)
